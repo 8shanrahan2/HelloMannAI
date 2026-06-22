@@ -2,9 +2,17 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? "0.0.0.0";
+
+type Session = {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+};
+
+const sessions = new Map<string, Session>();
 
 function createServer(): McpServer {
   const server = new McpServer({
@@ -155,18 +163,69 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/mcp", async (req, res) => {
-  const server = createServer();
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: () => randomUUID(),
-  });
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  let session = sessionId ? sessions.get(sessionId) : undefined;
 
-  res.on("close", () => {
-    void transport.close();
-    void server.close();
-  });
+  if (!session) {
+    if (!isInitializeRequest(req.body)) {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Bad Request: No valid MCP session. Send initialize first.",
+        },
+        id: req.body?.id ?? null,
+      });
+      return;
+    }
 
-  await server.connect(transport);
-  await transport.handleRequest(req, res, req.body);
+    const server = createServer();
+    let transport!: StreamableHTTPServerTransport;
+
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (newSessionId) => {
+        sessions.set(newSessionId, { server, transport });
+        console.log(`MCP session initialized: ${newSessionId}`);
+      },
+    });
+
+    transport.onclose = () => {
+      if (transport.sessionId) {
+        sessions.delete(transport.sessionId);
+        console.log(`MCP session closed: ${transport.sessionId}`);
+      }
+    };
+
+    await server.connect(transport);
+    session = { server, transport };
+  }
+
+  await session.transport.handleRequest(req, res, req.body);
+});
+
+app.get("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+
+  if (!session) {
+    res.status(400).send("Invalid or missing MCP session ID");
+    return;
+  }
+
+  await session.transport.handleRequest(req, res);
+});
+
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+
+  if (!session) {
+    res.status(400).send("Invalid or missing MCP session ID");
+    return;
+  }
+
+  await session.transport.handleRequest(req, res);
 });
 
 app.listen(PORT, HOST, () => {
